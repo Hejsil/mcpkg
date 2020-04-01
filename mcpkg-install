@@ -1,0 +1,90 @@
+#!/bin/sh
+
+program="${0##*/}"
+usage() {
+    echo "Usage: $program [ -ih ] [ -v VERSION ] MOD"
+    echo "A simple program that downloads minecraft mods using the curseforge API."
+    echo "This program will both download the mod itself and all its dependencies."
+    echo ""
+    echo "Requires: curl, jq"
+    echo ""
+    echo "    -h, --help             print this help message and exit."
+    echo "    -i, --id               find mod using its curseforge id instead of its name."
+    echo "    -v, --version VERSION  find the mod for a specific version of minecraft."
+}
+
+while [ -n "$1" ]; do
+    case $1 in
+        --) shift; break ;;
+        -h|--help) usage; exit 0 ;;
+        -i|--id) install_mod_id='yes';;
+        -v|--version) shift; version="$1";;
+        -*) usage; exit 1 ;;
+        *) break ;;
+    esac
+    shift
+done
+
+[ -n "$version" ] && version_selecter="| select(.gameVersion == \"$version\")"
+
+json=$(mktemp)
+mod_json=$(mktemp)
+url='https://addons-ecs.forgesvc.net/api/v2/addon'
+
+if [ -n "$install_mod_id" ]; then
+    for addon_id in "$@"; do
+        curl -s "$url/$addon_id" -o "$json"
+        jq ".id" "$json"
+        jq ".latestFiles[].dependencies[] | select( .type == 3 ).addonId" "$json"
+    done    
+else
+    search=$(echo "$1" | sed 's/[ ]/-/g')
+    curl -s "$url/search?gameId=432&searchFilter=$search&gameVersion=$version&pageSize=15" -o "$json"
+    
+    mod_count=$(jq -r '. | length' "$json")
+    case $mod_count in
+        0) 
+            echo 'No mods found' >&2
+            exit 1
+            ;;
+        1) pick=0 ;;
+        *) 
+            while true; do
+                jq -r '.[].name' "$json" | awk '{ print NR-1 " " $0 }' >&2
+                printf 'Pick mods: ' >&2
+                read -r pick
+                echo >&2
+    
+                [ -n "$pick" ] && break;
+            done
+            ;;
+    esac
+    
+    echo "$pick" | tr ' ' '\n' | while read -r num; do
+        jq ".[$num].id" "$json"
+        jq ".[$num].latestFiles[].dependencies[] | select( .type == 3 ).addonId" "$json"
+    done
+fi | sort -u | while read -r addon_id; do
+    curl -s "$url/$addon_id" -o "$mod_json"
+    
+    name=$(jq -r ".name" "$mod_json")
+    slug=$(jq -r ".slug" "$mod_json")
+    file_id=$(jq ".gameVersionLatestFiles[] $version_selecter | .projectFileId" "$mod_json" | head -n 1)
+    if [ -z "$file_id" ]; then
+        echo "'$name' does not have any files for version $version" >&2
+        continue
+    fi
+
+    download_url=$(curl -s "$url/$addon_id/file/$file_id/download-url")
+    file_name="$addon_id-$file_id-$slug.jar"
+
+    echo "Downloading '$name' to '$file_name'" >&2
+    curl -L -s "$download_url" -o "$file_name" || {
+        echo "Failed to download mod $name" >&2
+        continue
+    }
+done
+
+rm "$json"
+rm "$mod_json"
+

@@ -1,0 +1,73 @@
+#!/bin/sh
+
+program="${0##*/}"
+usage() {
+    echo "Usage: $program [ -h ] [ -v VERSION ] MOD_JAR_FILE"
+    echo "Updates a minecraft mod to its newest version."
+    echo "This tool requires that the file name is of a specific format:"
+    echo "<addon_id>-<file_id>-<slug>.jar"
+    echo "mcpkg-install downloads mods in this format."
+    echo ""
+    echo "    -h, --help     print this help message and exits."
+    echo "    -v, --version  download for a specfic version of Minecraft."
+}
+
+while [ -n "$1" ]; do
+    case $1 in
+        --) shift; break ;;
+        -h|--help) usage; exit 0 ;;
+        -v|--version) shift; version="$1";;
+        -*) usage; exit 1 ;;
+        *) break ;;
+    esac
+    shift
+done
+
+json=$(mktemp)
+url='https://addons-ecs.forgesvc.net/api/v2/addon'
+
+[ -n "$version" ] && version_selector="| select(.gameVersion == \"$version\")"
+
+echo "$1" | {
+    IFS='-' read -r addon_id file_id slug_ext
+    slug=${slug_ext%.jar}
+
+    curl -s "$url/$addon_id" -o "$json" || {
+        echo "Getting mod info failed" >&2
+        exit 1
+    }
+
+    remote_name=$(jq -r '.name' "$json")
+    remote_slug=$(jq -r '.slug' "$json")
+    if [ "$slug" != "$remote_slug" ]; then
+        echo "Slug for mod '$addon_id' does not match with slug found online:" >&2
+        echo "remote: '$remote_slug'" >&2
+        echo "local:  '$slug'" >&2
+        exit 1  
+    fi
+
+    remote_file_id=$(jq ".gameVersionLatestFiles[] $version_selector | .projectFileId" "$json" 2>/dev/null | head -n 1)
+    if [ -z "$remote_file_id" ]; then
+        echo "'$remote_name' does not have any files for version $version" >&2
+        exit 1
+    fi
+
+    if [ "$file_id" = "$remote_file_id" ]; then
+        echo "'$remote_name' is up to date" >&2
+        exit 0
+    fi
+    download_url=$(curl -s "$url/$addon_id/file/$remote_file_id/download-url")
+    new_file_name="$addon_id-$remote_file_id-$slug.jar"
+
+    echo "updating '$1' to '$new_file_name'" >&2
+    mv "$1" "$1.back"
+    curl -L "$download_url" -o "$new_file_name" || {
+        echo "Update failed" >&2
+        move "$1.back" "$1"
+        exit 1
+    }
+    rm "$1.back"
+}
+
+rm "$json"
+
